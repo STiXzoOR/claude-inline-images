@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Claude Code ${{ matrix.claude }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        # 2.1.287 is the first version with mods on by default.
+        claude: ['2.1.287', latest]
+    env:
+      DISABLE_AUTOUPDATER: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code@${{ matrix.claude }} && claude --version
+      - name: Validate the marketplace and the mod
+        run: |
+          claude plugin validate .
+          claude plugin validate plugins/inline-images
+      - name: Test the mod
+        run: claude plugin test plugins/inline-images

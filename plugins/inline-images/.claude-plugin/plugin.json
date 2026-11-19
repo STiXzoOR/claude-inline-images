@@ -1,6 +1,6 @@
 {
   "name": "inline-images",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Draws the images you paste, the images tools return and the files Claude sends inline in the terminal transcript, instead of [Image #1] text. /image opens one full size.",
   "userConfig": {
     "renderer": {
