@@ -71,6 +71,24 @@ describe('historyIndex', () => {
     expect(index.get('prompt:[Image #1] what is this')).toEqual([{ mediaType: 'image/png', data: 'PASTE' }])
   })
 
+  test('finds an image sent mid-turn by its own text, without the frame the request wraps it in', () => {
+    const midTurn = [
+      {
+        role: 'user' as const,
+        content: [
+          { type: 'tool_result', tool_use_id: 'toolu_busy', content: 'ok' },
+          {
+            type: 'text',
+            text: '<system-reminder>\nThe user sent a new message while you were working:\nlook at this [Image #2]\n\nThis is how Claude Code surfaces messages the user sends mid-turn — within the running turn. Address the message above as you continue this turn.\n</system-reminder>',
+          },
+          png('LATE'),
+        ],
+      },
+    ]
+
+    expect(historyIndex(midTurn, '/work').get('prompt:look at this [Image #2]')).toEqual([{ mediaType: 'image/png', data: 'LATE' }])
+  })
+
   test('finds a tool result image by its tool_use_id', () => {
     expect(historyIndex(messages, '/work').get('toolu_read')).toEqual([{ mediaType: 'image/png', data: 'READ' }])
   })

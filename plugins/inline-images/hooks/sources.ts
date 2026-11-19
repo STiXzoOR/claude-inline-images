@@ -62,6 +62,15 @@ const absolute = (path: string, cwd: string) => (path.startsWith('/') ? path : `
  * drawn: a pasted image by `prompt:<the text beside it>`, a tool result's by
  * its tool_use_id, and the files a SendUserFile call sent by that call's id.
  */
+/**
+ * The text a person typed, out of the frame a request wraps a message sent
+ * mid-turn in; any other text as it is.
+ */
+export const typedText = (text: string) => {
+  const framed = /^(?:<system-reminder>\s*)?The user sent a new message while you were working:\n([\s\S]*?)(?:\n\nThis is how Claude Code surfaces[\s\S]*)?(?:\s*<\/system-reminder>)?\s*$/.exec(text)
+  return (framed?.[1] ?? text).trim()
+}
+
 export const historyIndex = (messages: readonly ApiMessage[], cwd: string) => {
   const index = new Map<string, Source[]>()
   const add = (key: string, sources: Source[]) => {
@@ -73,7 +82,7 @@ export const historyIndex = (messages: readonly ApiMessage[], cwd: string) => {
     if (message.role === 'user') {
       const pasted = blocks.flatMap(block => inline(block) ?? [])
       for (const block of blocks) {
-        if (block.type === 'text' && typeof block.text === 'string') add(`prompt:${block.text.trim()}`, pasted)
+        if (block.type === 'text' && typeof block.text === 'string') add(`prompt:${typedText(block.text)}`, pasted)
         if (block.type === 'tool_result') {
           add(String(block.tool_use_id), blocksOf(block.content).flatMap(inner => inline(inner) ?? []))
         }

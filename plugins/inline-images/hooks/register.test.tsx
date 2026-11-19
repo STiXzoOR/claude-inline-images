@@ -34,6 +34,12 @@ type World = {
   history?: unknown[]
   env?: Record<string, string>
   png?: string
+  /** What magick prints for a decode: the picture's size, then the pixel copy's. */
+  decoded?: string
+  /** How many crops fail before they work. */
+  cropFails?: number
+  /** Asked before each crop: a promise holds it until it resolves. */
+  cropGate?: () => Promise<void> | undefined
 }
 type Run = { argv: readonly string[]; stdin?: string }
 
@@ -44,18 +50,38 @@ const failed = { value: { exitCode: 1, stdout: '', stderr: 'no', isStdoutTruncat
 
 const world = (
   on: On,
-  { terminal = 'WarpTerminal', hasMagick = true, canDecode = true, history = [], env = {}, png = PNG }: World = {},
+  { terminal = 'WarpTerminal', hasMagick = true, canDecode = true, history = [], env = {}, png = PNG, decoded = '2 2 2 2', cropFails = 0, cropGate }: World = {},
 ) => {
   const runs: Run[] = []
   const files = new Map<string, string>()
   mock.env(on, { TERM_PROGRAM: terminal, TMPDIR: `${TMP}/`, ...env })
 
-  on('process.run', ($, e) => {
+  opened.length = 0
+  openedWith.length = 0
+  // The test kit draws no panes: answer opens and closes as a surface placing them.
+  on('ui.open', ($, e) => {
+    opened.push(e.id)
+    openedWith.push(e as Record<string, unknown>)
+    return { value: { isPlaced: true } }
+  })
+  on('ui.close', () => ({ value: undefined }))
+  let failsLeft = cropFails
+  on('process.run', async ($, e) => {
     runs.push({ argv: e.argv, stdin: e.init?.stdin })
     const [command] = e.argv
     if (command === 'magick') {
       if (!hasMagick) return { deny: 'magick: command not found' }
-      return canDecode ? ok('2 2 2 2') : failed
+      if (!canDecode) return failed
+      if (e.argv.includes('-crop')) {
+        if (failsLeft > 0) {
+          failsLeft--
+          return failed
+        }
+        await cropGate?.()
+        // A crop prints only its pixel copy's size.
+        return ok('2 2')
+      }
+      return ok(decoded)
     }
     if (command === 'sips' || command === '/usr/bin/sips') {
       if (!canDecode) return failed
@@ -371,24 +397,327 @@ const runImage = ($: Engine, args: string) =>
     presentation: { isFullscreen: false, columns: 100 },
   })
 
-test('/image <n> opens that picture full size in the image viewer', async ($, on) => {
-  const runs = world(on)
+const LIGHTBOX = 'lightbox'
+const PANE = {
+  title: 'Images', isFocused: true, bodyColumns: 80, placement: 'inline' as const,
+  scroll: { offset: 0, bodyRows: 30 }, view: {},
+}
+
+const mountLightbox = ($: Engine) =>
+  $.ui.mount({ plugin: PLUGIN, surface: 'terminal', component: 'Pane', props: PANE, requestId: LIGHTBOX, viewport: VIEWPORT })
+
+/** The ids of the panes the mod opened since the last world, and how. */
+const opened: string[] = []
+const openedWith: Record<string, unknown>[] = []
+
+const header = async (ui: Awaited<ReturnType<typeof mountLightbox>>) =>
+  (await ui.find({ type: 'Text', text: /^image \d+ of \d+/ }))?.text
+
+/** The header's zoom: `fit`, or how far in. */
+const zoom = async (ui: Awaited<ReturnType<typeof mountLightbox>>) =>
+  (await ui.find({ type: 'Text', text: /^\d+×\d+ · / }))?.text.split(' · ').at(-1)
+
+/** Two pictures: 1 pasted, 2 from a tool. */
+const twoPictures = async ($: Engine) => {
   await pasted($, UUID)
+  await toolImage($, 'toolu_1')
+}
 
-  const answer = await runImage($, '1')
+const crops = (runs: Run[]) => runs.filter(run => run.argv[0] === 'magick' && run.argv.includes('-crop'))
 
-  const opened = runs.find(run => run.argv[0] === 'open')
-  expect(opened?.argv.at(-1)).toMatch(/\.png$/)
-  expect(JSON.stringify(answer)).toMatch(/image 1/)
+test('/image <n> opens that picture in the lightbox pane', async ($, on) => {
+  world(on, { terminal: 'ghostty' })
+  await twoPictures($)
+
+  await runImage($, '2')
+  const ui = await mountLightbox($)
+
+  expect(opened).toContain(LIGHTBOX)
+  expect(await header(ui)).toMatch(/^image 2 of 2/)
+  expect((await ui.find({ type: 'Image' }))?.props.source).toBeDefined()
 })
 
-test('/image lists the pictures of the conversation', async ($, on) => {
+test('the lightbox lets the terminal show through, as Claude Code\'s own panes do', async ($, on) => {
+  world(on, { terminal: 'ghostty' })
+  await pasted($, UUID)
+
+  await runImage($, '1')
+
+  expect(openedWith.at(-1)?.backgroundColor).toBe('transparent')
+})
+
+test('never draws a small picture bigger than it is', async ($, on) => {
+  // A 100x100 picture is 13 columns of 8 pixels and 7 rows of 16, however big the pane.
+  world(on, { terminal: 'ghostty', decoded: '100 100 2 2' })
+  await pasted($, UUID)
+  await runImage($, '1')
+  const ui = await mountLightbox($)
+
+  const image = await ui.find({ type: 'Image' })
+  expect(image?.props.columns).toBeLessThanOrEqual(13)
+  expect(image?.props.rows).toBeLessThanOrEqual(7)
+})
+
+test('shows no hotkey buttons, only the strip to click', async ($, on) => {
+  world(on, { terminal: 'ghostty' })
+  await twoPictures($)
+  await runImage($, '2')
+  const ui = await mountLightbox($)
+
+  await ui.press({ key: 'strip-previous' })
+  expect(await header(ui)).toMatch(/^image 1 of 2/)
+  await ui.press({ key: 'strip-next' })
+  expect(await header(ui)).toMatch(/^image 2 of 2/)
+  expect(await ui.find({ type: 'Text', text: /esc close/ })).toBeDefined()
+})
+
+test('/image with nothing after it opens the latest picture', async ($, on) => {
+  world(on, { terminal: 'ghostty' })
+  await twoPictures($)
+
+  await runImage($, '')
+  const ui = await mountLightbox($)
+
+  expect(await header(ui)).toMatch(/^image 2 of 2/)
+})
+
+test('/image list lists the pictures of the conversation', async ($, on) => {
   world(on)
   await pasted($, UUID)
 
-  const answer = await runImage($, '')
+  const answer = await runImage($, 'list')
 
   expect(JSON.stringify(answer)).toMatch(/image 1 · 2×2/)
+})
+
+test('steps through the pictures with its buttons, wrapping round', async ($, on) => {
+  world(on, { terminal: 'ghostty' })
+  await twoPictures($)
+  await runImage($, '2')
+  const ui = await mountLightbox($)
+
+  await ui.press({ key: 'next' })
+  expect(await header(ui)).toMatch(/^image 1 of 2/)
+  await ui.press({ key: 'previous' })
+  expect(await header(ui)).toMatch(/^image 2 of 2/)
+})
+
+test('zooms in by drawing a crop of the picture, and fit shows it whole again', async ($, on) => {
+  const runs = world(on, { terminal: 'ghostty' })
+  await pasted($, UUID)
+  await runImage($, '1')
+  const ui = await mountLightbox($)
+
+  await ui.press({ key: 'zoom-in' })
+  expect(await zoom(ui)).toBe('2×')
+  expect(crops(runs)).toHaveLength(1)
+  expect(String(((await ui.find({ type: 'Image' }))?.props.source as { file?: string } | undefined)?.file)).toMatch(/\.crop-[\d-]+\.png$/)
+
+  // One picture needs no strip of numbers.
+  expect(await ui.find({ key: 'go-1' })).toBeUndefined()
+
+  await ui.press({ key: 'fit' })
+  expect(String(((await ui.find({ type: 'Image' }))?.props.source as { file?: string } | undefined)?.file)).not.toMatch(/\.crop-/)
+})
+
+test('takes arrow keys and + from the pad laid over the picture', async ($, on) => {
+  world(on, { terminal: 'ghostty' })
+  await twoPictures($)
+  await runImage($, '1')
+  const ui = await mountLightbox($)
+
+  await ui.key({ key: 'right', in: 'pad' })
+  expect(await header(ui)).toMatch(/^image 2 of 2/)
+  await ui.key({ key: '+', in: 'pad' })
+  expect(await zoom(ui)).toBe('2×')
+})
+
+test('pans a zoomed picture with a drag on the pad', async ($, on) => {
+  // A 100x100 picture, so a pan moves the crop by whole pixels.
+  const runs = world(on, { terminal: 'ghostty', decoded: '100 100 2 2' })
+  await pasted($, UUID)
+  await runImage($, '1')
+  const ui = await mountLightbox($)
+  await ui.press({ key: 'zoom-in' })
+  await ui.resize({ columns: 10, rows: 10, in: 'pad' })
+
+  // Dragging the picture right by half the pad shows more of its left side.
+  await ui.pointer({ type: 'down', x: 2, y: 5, button: 'left' })
+  await ui.pointer({ type: 'move', x: 7, y: 5, button: 'left' })
+  await ui.pointer({ type: 'up', x: 7, y: 5, button: 'left' })
+
+  const last = crops(runs).at(-1)?.argv
+  expect(last?.[last.indexOf('-crop') + 1]).toBe('50x50+0+25')
+})
+
+test('jumps to a picture from the strip of numbers', async ($, on) => {
+  world(on, { terminal: 'ghostty' })
+  await twoPictures($)
+  await runImage($, '2')
+  const ui = await mountLightbox($)
+  await ui.press({ key: 'zoom-in' })
+
+  await ui.press({ key: 'go-1' })
+
+  expect(await header(ui)).toMatch(/^image 1 of 2/)
+  expect(await zoom(ui)).toBe('fit')
+})
+
+test('opens the picture in the system viewer with v', async ($, on) => {
+  const runs = world(on, { terminal: 'ghostty' })
+  await pasted($, UUID)
+  await runImage($, '1')
+  const ui = await mountLightbox($)
+
+  await ui.press({ key: 'viewer' })
+
+  expect(runs.find(run => run.argv[0] === 'open')?.argv.at(-1)).toMatch(/\.png$/)
+})
+
+test('a click on a caption opens that picture in the lightbox', async ($, on) => {
+  world(on, { terminal: 'ghostty' })
+  await pasted($, UUID)
+  const row = await mountPrompt($)
+
+  await row.press({ key: 'open-1' })
+  const ui = await mountLightbox($)
+
+  expect(opened).toContain(LIGHTBOX)
+  expect(await header(ui)).toMatch(/^image 1 of 1/)
+})
+
+test('shows the conversation\'s pictures as thumbnails, the open one framed in Claude\'s colour', async ($, on) => {
+  world(on, { terminal: 'ghostty' })
+  await twoPictures($)
+  await runImage($, '2')
+  const ui = await mountLightbox($)
+
+  expect(await ui.find({ type: 'Image', key: 'thumb-1' })).toBeDefined()
+  expect(await ui.find({ type: 'Image', key: 'thumb-2' })).toBeDefined()
+  expect((await ui.find({ key: 'frame-2' }))?.props.borderColor).toBe('claude')
+  expect((await ui.find({ key: 'frame-1' }))?.props.borderColor).not.toBe('claude')
+
+  await ui.press({ key: 'go-1' })
+  expect(await header(ui)).toMatch(/^image 1 of 2/)
+})
+
+test('a click on a thumbnail opens that picture', async ($, on) => {
+  world(on, { terminal: 'ghostty' })
+  await twoPictures($)
+  await runImage($, '2')
+  const ui = await mountLightbox($)
+
+  await ui.post({ type: 'tap', n: 1 }, { in: 'tap-1' })
+
+  expect(await header(ui)).toMatch(/^image 1 of 2/)
+})
+
+test('falls back to numbers where the pane is too short for thumbnails', async ($, on) => {
+  world(on, { terminal: 'ghostty' })
+  await twoPictures($)
+  await runImage($, '2')
+  const ui = await $.ui.mount({
+    plugin: PLUGIN, surface: 'terminal', component: 'Pane',
+    props: { ...PANE, scroll: { offset: 0, bodyRows: 12 } }, requestId: LIGHTBOX, viewport: VIEWPORT,
+  })
+
+  expect(await ui.find({ key: 'thumb-1' })).toBeUndefined()
+  expect(await ui.find({ key: 'go-1' })).toBeDefined()
+})
+
+test('shows a navigator with the part in view boxed while zoomed in', async ($, on) => {
+  // Big enough that the stage has room for a navigator.
+  const runs = world(on, { terminal: 'ghostty', decoded: '1000 1000 2 2' })
+  await pasted($, UUID)
+  await runImage($, '1')
+  const ui = await mountLightbox($)
+  expect(await ui.find({ key: 'navigator' })).toBeUndefined()
+
+  await ui.press({ key: 'zoom-in' })
+
+  expect(await ui.find({ type: 'Image', key: 'navigator' })).toBeDefined()
+  expect(runs.some(run => run.argv[0] === 'magick' && run.argv.includes('-draw'))).toBe(true)
+})
+
+test('enlarges a zoomed crop by nearest neighbour, so its pixels stay sharp', async ($, on) => {
+  const runs = world(on, { terminal: 'ghostty', decoded: '100 100 2 2' })
+  await pasted($, UUID)
+  await runImage($, '1')
+  const ui = await mountLightbox($)
+
+  await ui.press({ key: 'zoom-in' })
+
+  const crop = crops(runs).at(-1)?.argv ?? []
+  expect(crop[crop.indexOf('-filter') + 1]).toBe('point')
+})
+
+const imageFile = async (ui: Awaited<ReturnType<typeof mountLightbox>>) =>
+  String(((await ui.find({ type: 'Image', key: 'lightbox-image' }))?.props.source as { file?: string } | undefined)?.file)
+
+test('tries a crop that failed again, and never blames ImageMagick while it is there', async ($, on) => {
+  const runs = world(on, { terminal: 'ghostty', decoded: '100 100 2 2', cropFails: 1 })
+  await pasted($, UUID)
+  await runImage($, '1')
+  const ui = await mountLightbox($)
+
+  await ui.press({ key: 'zoom-in' })
+  expect(await zoom(ui)).toBe('2×')
+  await ui.press({ key: 'fit' })
+  await ui.press({ key: 'zoom-in' })
+
+  expect(crops(runs)).toHaveLength(2)
+  expect(await imageFile(ui)).toMatch(/\.crop-/)
+})
+
+test('keeps the last sharp view on screen while the next crop is made, and makes only the latest', async ($, on) => {
+  let hold: Promise<void> | undefined
+  let release = () => {}
+  const runs = world(on, { terminal: 'ghostty', decoded: '1000 1000 2 2', cropGate: () => hold })
+  await pasted($, UUID)
+  await runImage($, '1')
+  const ui = await mountLightbox($)
+  await ui.press({ key: 'zoom-in' })
+  const first = await imageFile(ui)
+  expect(first).toMatch(/\.crop-/)
+  const before = crops(runs).length
+
+  // Hold the crops, and zoom three more times while one is being made.
+  hold = new Promise<void>(resolve => (release = resolve))
+  const presses = [ui.press({ key: 'zoom-in' }), ui.press({ key: 'zoom-in' }), ui.press({ key: 'zoom-in' })]
+  expect(await imageFile(ui)).toBe(first)
+  hold = undefined
+  release()
+  await Promise.all(presses)
+
+  expect(await zoom(ui)).toBe('8×')
+  // The one in flight, then the latest: never one per press.
+  expect(crops(runs).length - before).toBeLessThanOrEqual(2)
+  expect(await imageFile(ui)).not.toBe(first)
+})
+
+test('has a close button and big arrows beside the thumbnails', async ($, on) => {
+  world(on, { terminal: 'ghostty' })
+  await twoPictures($)
+  await runImage($, '2')
+  const ui = await mountLightbox($)
+
+  expect((await ui.find({ key: 'close-button' }))?.text).toMatch(/✕/)
+  expect((await ui.find({ key: 'strip-previous' }))?.text).toMatch(/❮/)
+  expect((await ui.find({ key: 'strip-next' }))?.text).toMatch(/❯/)
+  await ui.press({ key: 'close-button' })
+  expect(await header(ui)).toBeUndefined()
+})
+
+test('draws block symbols in the lightbox where the terminal draws no pictures', async ($, on) => {
+  world(on)
+  await pasted($, UUID)
+  await runImage($, '1')
+  const ui = await mountLightbox($)
+
+  expect(await ui.find({ type: 'Raster' })).toBeDefined()
+  expect(await ui.find({ type: 'Image' })).toBeUndefined()
+  // A Client laid over a Raster blanks it, so block symbols get no pad.
+  expect(await ui.find({ type: 'Client' })).toBeUndefined()
 })
 
 test('leaves the desktop app to draw images itself', async ($, on) => {

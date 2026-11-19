@@ -14,7 +14,7 @@ A Claude Code mod that draws images in the terminal transcript, under the row th
 - **Every image in the conversation:** the ones you paste or drag in, the ones tools return (a `Read` of a picture, browser screenshots, MCP images) and the files Claude sends you with `SendUserFile`. They come back when you `--resume` or `--continue`.
 - **Real pixels** in kitty, Ghostty and Rex, including inside tmux and over ssh.
 - **Block symbols everywhere else:** each cell picks the closest of 24 block glyphs and two colours, so shapes and colour survive in any truecolor terminal.
-- **`/image N`** opens a picture at full size in your image viewer. `/image` lists them.
+- **A lightbox:** `/image N`, or a click on a caption, opens a picture big. Step through the conversation's pictures, zoom toward the pointer with the wheel or trackpad, drag to pan.
 
 Without it, Claude Code shows only this:
 
@@ -54,6 +54,28 @@ Update with `claude plugin update inline-images@claude-inline-images`, then rest
 - **Claude Code 2.1.311 or later.** Mods are on by default since 2.1.287. CI tests 2.1.311 and the latest release.
 - **ImageMagick 7 (`magick`)** to decode. On macOS the built-in `sips` stands in when it's missing. On Ubuntu, the `imagemagick` package is version 6, which has no `magick`: use the official AppImage from the ImageMagick releases, extracted with `--appimage-extract` so it needs no FUSE.
 
+## The lightbox
+
+`/image 3` opens image 3, `/image` the latest, and `/image list` lists them. A click on a picture's caption opens it too.
+
+| | Keys (no click needed) | Mouse and trackpad |
+|---|---|---|
+| Previous, next | `p` `n` | `❮` `❯`, a thumbnail or its number |
+| Zoom | `z` `x` | the wheel or a two-finger scroll, toward the pointer |
+| Pan | `w` `a` `s` `d` | drag the picture |
+| Fit | `f` or `0` | |
+| System viewer | `v` | |
+| Close | Esc or `q` | `✕ close` |
+
+With real pixels, a click on the picture also gives it ← → to step and + − to zoom.
+
+While you're zoomed in, a navigator in the top right corner shows the whole picture with the part in view boxed in orange. Past the picture's own resolution, pixels stay sharp squares rather than blurring.
+
+- **Clicks and drags need Claude Code's fullscreen layout** (`/tui fullscreen`), where the lightbox docks beside the transcript. In the default layout it sits above the prompt and the keys and wheel drive it.
+- **Block symbols take no drags or clicks on the picture.** Anything laid over a `Raster` blanks it, so there the wheel, the keys and the buttons drive.
+- A mod can't cover the whole screen. For that, press `v`.
+- Zoom needs ImageMagick (`magick`); with only `sips` the lightbox shows the picture at fit.
+
 ## Where it draws pixels
 
 | Terminal | Draws | Needs |
@@ -92,7 +114,8 @@ The mod reads the conversation's images, decodes them and draws them. It makes n
 - `magick` to decode a picture to a PNG and a 480-pixel RGBA copy, or on macOS without ImageMagick, `/usr/bin/sips` and `/usr/bin/base64`
 - `sh -c 'base64 -d >"$1"'` to write a pasted image to a file first, since ImageMagick 7.1.2 and later refuse a data URI on stdin
 - `mkdir -p` and `find <cache> -type f -mtime +7 -delete` for its cache in `$TMPDIR/claude-inline-images`
-- `open` (macOS) or `xdg-open` (Linux) when you run `/image N`
+- `magick <picture> -crop …` when you zoom in the lightbox
+- `open` (macOS) or `xdg-open` (Linux) when you press `v` in the lightbox
 
 Decodes are named by content, so a picture seen twice is decoded once.
 
