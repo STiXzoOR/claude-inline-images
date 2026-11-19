@@ -4,7 +4,7 @@
 
 - The mod moved to `plugins/inline-images/`, so the screenshots and docs in this repository no longer download with it. The install line is unchanged.
 - The README no longer asks for `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS`: mods are on by default since Claude Code 2.1.287, which ignores it.
-- CI runs the mod's tests on Linux and macOS, against Claude Code 2.1.287 and the latest release.
+- CI runs the mod's tests on Linux and macOS, against Claude Code 2.1.311 and the latest release. The README now names 2.1.311 as the minimum.
 
 ## 0.2.2 (2026-11-19)
 

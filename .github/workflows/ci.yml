@@ -17,8 +17,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        # 2.1.287 is the first version with mods on by default.
-        claude: ['2.1.287', latest]
+        # The oldest version the tests pass on: 2.1.287's test kit has no
+        # session.append. 2.1.311 is the stable channel today.
+        claude: ['2.1.311', latest]
     env:
       DISABLE_AUTOUPDATER: '1'
     steps:

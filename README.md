@@ -31,7 +31,7 @@ Update later with `claude plugin update inline-images@claude-inline-images`, the
 
 ## Needs
 
-- **Claude Code 2.1.287 or later**, where mods are on by default. CI tests 2.1.287 and the latest release.
+- **Claude Code 2.1.311 or later.** Mods are on by default since 2.1.287, but CI tests 2.1.311 (the stable channel) and the latest release, and the tests need 2.1.311.
 - **ImageMagick 7 (`magick`)** to decode. On macOS the built-in `sips` stands in when ImageMagick is missing. Ubuntu's `imagemagick` package is version 6, which has no `magick`: use the official AppImage from the ImageMagick releases, extracted with `--appimage-extract` so it needs no FUSE.
 
 Decodes are cached by content in `$TMPDIR/claude-inline-images` and removed after 7 days. ImageMagick 7.1.2 and later refuse `inline:-` (a data URI on stdin), so pasted images are written to `<id>.src` first and decoded from there.
