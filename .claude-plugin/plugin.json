@@ -1,0 +1,45 @@
+{
+  "name": "inline-images",
+  "version": "0.2.2",
+  "description": "Draws the images you paste, the images tools return and the files Claude sends inline in the terminal transcript, instead of [Image #1] text. /image opens one full size.",
+  "userConfig": {
+    "renderer": {
+      "type": "string",
+      "title": "Renderer",
+      "description": "auto: real pixels where Claude Code draws them (kitty, Ghostty, or CLAUDE_CODE_FORCE_TERMINAL_IMAGES), block symbols elsewhere (Warp, iTerm2, Terminal). symbols, blocks (plain half blocks) or pixels force one.",
+      "default": "auto",
+      "options": [
+        "auto",
+        "symbols",
+        "blocks",
+        "pixels"
+      ]
+    },
+    "maxColumns": {
+      "type": "number",
+      "title": "Max width (columns)",
+      "description": "Widest an image is drawn, in terminal columns.",
+      "default": 64
+    },
+    "maxRows": {
+      "type": "number",
+      "title": "Max height (rows)",
+      "description": "Tallest an image is drawn, in terminal rows.",
+      "default": 22
+    }
+  },
+  "author": {
+    "name": "STiXzoOR",
+    "url": "https://github.com/STiXzoOR"
+  },
+  "homepage": "https://github.com/STiXzoOR/claude-inline-images",
+  "repository": "https://github.com/STiXzoOR/claude-inline-images",
+  "license": "MIT",
+  "keywords": [
+    "images",
+    "terminal",
+    "kitty",
+    "tmux",
+    "mod"
+  ]
+}

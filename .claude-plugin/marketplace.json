@@ -1,0 +1,6 @@
+{
+  "name": "claude-inline-images",
+  "owner": { "name": "STiXzoOR", "url": "https://github.com/STiXzoOR" },
+  "metadata": { "description": "Inline images in the Claude Code terminal transcript." },
+  "plugins": [{ "name": "inline-images", "source": "./" }]
+}
