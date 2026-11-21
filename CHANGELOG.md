@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Inside tmux, the mod sends a file path again when every client attached to the session runs on this machine, instead of the PNG's bytes. It asks `tmux list-clients` every 2 seconds, and `ps` when the clients change: a client started under `sshd` or `mosh-server`, or a check that fails, gets the picture's bytes. When a client leaves and every one left is local, the pictures go back to file paths.
+- A terminal that attaches to tmux after the pictures drew now gets them. tmux replays its text but not its pictures, so it showed an empty box until something redrew it. The mod sends the pictures again and has tmux redraw that terminal's screen once they arrived.
+- Inside tmux, `SSH_CONNECTION` no longer counts: tmux copies it from whichever client attached last into every pane started after, so a pane opened after one ssh attach sent bytes for good.
+- `CLAUDE_INLINE_IMAGES_LOCAL=1` or `0` says whether the terminal can open files on this machine, where the check can't tell.
+
 ## 0.3.0 (2026-11-19)
 
 - A lightbox. `/image N`, `/image` for the latest, or a click on a picture's caption opens it in a pane: step through the conversation's pictures, zoom up to 8×, pan, or hand one to the system viewer.

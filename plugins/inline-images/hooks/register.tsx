@@ -1,6 +1,7 @@
-import type { EngineInterface, ImageSource, Register } from 'claude-code'
+import type { EngineInterface, ImageSource, Register, Timer } from 'claude-code'
 
 import { decodeBmp } from './bmp'
+import { clientsAreLocal } from './clients'
 import { crispFactor, cropRect, fitView, navigatorBox, panBy, pointerAt, step, thumbWindow, zoomAt } from './lightbox'
 import type { Stage, View } from './lightbox'
 import type { PadMessage } from './pad'
@@ -38,6 +39,15 @@ const MAX_IMAGE_BYTES = 2 * 1024 * 1024
 const LIGHTBOX = 'lightbox'
 const ZOOM_STEP = 2
 const WHEEL_STEP = 1.1
+// How often tmux is asked which clients are attached, once a picture drew in
+// it, and how long each of the two commands that answer may take. When tmux
+// redraws a terminal that attached, after the pictures were sent again: Claude
+// Code streams a picture's bytes over a while (half a megabyte took 600 ms),
+// and a redraw before the last chunk paints nothing, so once soon and once for
+// big or many pictures.
+const CLIENTS_WATCH_MS = 2_000
+const CLIENTS_TIMEOUT_MS = 2_000
+const REPAINT_AFTER_MS = [1_000, 3_000]
 
 // Every picture this load has decoded, numbered in the order it met them.
 const catalog: Picture[] = []
@@ -67,6 +77,15 @@ let added = 0
 let cacheDir: string | undefined
 let hasMagick: boolean | undefined
 let decoding = 0
+// What the last look at tmux found: the attached clients' pids, and whether
+// every one is on this machine. The look under way, if any. Whether a picture
+// asked, so the watch has something to keep right. The watch itself.
+let tmuxSeen: { clients: string; local: boolean } | undefined
+let tmuxLooking: Promise<boolean> | undefined
+let tmuxAsked = false
+let tmuxWatch: Timer | undefined
+// How many times terminals attached since the pictures first drew: part of every Image's key.
+let tmuxGeneration = 0
 const queued: (() => void)[] = []
 
 // What a picture is, whichever read of the conversation it came from.
@@ -303,23 +322,106 @@ async function cellsFor($: EngineInterface, picture: Decoded, columns: number, r
   return cellCache.get(key)
 }
 
-/** Whether the terminal surely runs on this machine: not over ssh, not in tmux or screen. */
+/**
+ * What the environment alone says: the terminal is on this machine (true),
+ * elsewhere (false), or in tmux, whose clients must be asked at this socket.
+ * Inside tmux the ssh variables say nothing: tmux copies SSH_CONNECTION from
+ * whichever client attached last into every pane started after, so only the
+ * clients tell. Outside it, ssh or screen mean elsewhere.
+ * CLAUDE_INLINE_IMAGES_LOCAL=1 or 0 settles it where the check can't.
+ */
+async function placeOf($: EngineInterface): Promise<boolean | string> {
+  const told = await $.env.get('CLAUDE_INLINE_IMAGES_LOCAL')
+  if (told === '1') return true
+  if (told === '0') return false
+  if (await $.env.get('STY')) return false
+  // TMUX is the server's socket, its pid and the session's index.
+  const tmux = await $.env.get('TMUX')
+  if (tmux) return tmux.split(',')[0] ?? ''
+  const ssh = [await $.env.get('SSH_CONNECTION'), await $.env.get('SSH_CLIENT')]
+  return !ssh.some(Boolean)
+}
+
+/** Whether the terminal surely runs on this machine: in tmux, whether every client attached to the session does. */
 async function onThisMachine($: EngineInterface) {
-  const elsewhere = [
-    await $.env.get('TMUX'),
-    await $.env.get('STY'),
-    await $.env.get('SSH_CONNECTION'),
-    await $.env.get('SSH_CLIENT'),
-  ]
-  return !elsewhere.some(Boolean)
+  const place = await placeOf($)
+  if (typeof place === 'boolean') return place
+  tmuxAsked = true
+  return tmuxSeen?.local ?? lookAtTmux($, place)
+}
+
+/**
+ * Asks tmux which clients are attached and whether every one runs on this
+ * machine: none was started under sshd or mosh-server. `ps` runs only when
+ * the clients changed. When a terminal attached, every picture is sent again
+ * (a new key), as bytes or file names for whoever is attached now, and tmux
+ * then redraws that terminal's screen so it paints them: a terminal draws a
+ * picture only over cells it is sent after the picture. When one left and the
+ * answer changed, the pictures are drawn again as file names. Anything that
+ * fails counts as not local.
+ */
+function lookAtTmux($: EngineInterface, socket: string) {
+  tmuxLooking ??= (async () => {
+    const ask = async (argv: string[]) => {
+      const ran = await $.process.run(argv, { timeoutMs: CLIENTS_TIMEOUT_MS }).catch(() => undefined)
+      return ran?.exitCode === 0 ? ran.stdout : undefined
+    }
+    const pane = await $.env.get('TMUX_PANE')
+    const target = pane ? ['-t', pane] : []
+    const listed = await ask(['tmux', '-S', socket, 'list-clients', ...target, '-F', '#{client_pid} #{client_tty}'])
+    const rows = (listed ?? '').split('\n').map(line => line.trim().split(/\s+/)).filter(([pid]) => pid && /^\d+$/.test(pid))
+    const clients = listed === undefined ? '?' : rows.map(([pid]) => pid).sort().join(' ')
+    if (tmuxSeen !== undefined && tmuxSeen.clients === clients) return tmuxSeen.local
+    const ps = listed === undefined ? undefined : await ask(['ps', '-A', '-o', 'pid=,ppid=,comm='])
+    const local = ps !== undefined && clientsAreLocal(rows.map(([pid]) => pid).join('\n'), ps)
+    const before = tmuxSeen
+    tmuxSeen = { clients, local }
+    if (before === undefined) return local
+    const known = new Set(before.clients.split(' '))
+    const attached = rows.filter(([pid]) => !known.has(pid ?? '')).map(([, tty]) => tty ?? '').filter(Boolean)
+    if (attached.length > 0) {
+      tmuxGeneration++
+      $.ui.invalidate('ui.render')
+      for (const ms of REPAINT_AFTER_MS) {
+        $.clock.after(ms, () => {
+          for (const tty of attached) void ask(['tmux', '-S', socket, 'refresh-client', '-t', tty])
+        })
+      }
+    } else if (before.local !== local) {
+      $.ui.invalidate('ui.render')
+    }
+    return local
+  })().finally(() => {
+    tmuxLooking = undefined
+  })
+  return tmuxLooking
+}
+
+/** Keeps looking at tmux's clients while a picture drew in it, so an attach or detach redraws them. */
+async function watchTmux($: EngineInterface) {
+  const place = await placeOf($)
+  if (typeof place !== 'string') return
+  tmuxWatch?.cancel()
+  tmuxWatch = $.clock.every(CLIENTS_WATCH_MS, () => {
+    if (tmuxAsked) void lookAtTmux($, place).catch(() => undefined)
+  })
 }
 
 const decodedSize = (base64: string) => Math.floor((base64.length * 3) / 4) - (base64.match(/=*$/)?.[0].length ?? 0)
 
 /**
+ * An Image's key, new each time a terminal attaches to tmux. A terminal that
+ * attaches after a picture was sent has its cells but never got its pixels:
+ * tmux replays text to it, not pictures. Drawn again under the same key, an
+ * Image is replaced in place and nothing is sent again; under a new key it is
+ * sent again, as bytes or as a file name for whoever is attached now.
+ */
+const imageKey = (base: string) => (tmuxGeneration === 0 ? base : `${base}~${tmuxGeneration}`)
+
+/**
  * What an Image is sent. A file name draws only where the terminal can open
  * the file, so it goes only to a terminal on this machine. Elsewhere (over
- * ssh, or in tmux, where a client may be attached from another machine) the
+ * ssh, or in tmux with a client attached from another machine) the
  * picture's own bytes go: the PNG, or past the 2 MiB an Image takes, the
  * small pixel copy.
  */
@@ -370,7 +472,7 @@ async function withPictures(
     if (renderer === 'pixels') {
       drawn.push(
         <Box key={`picture-${picture.n}`} flexDirection="column" paddingLeft={2}>
-          <Image key={`image-${picture.n}`} source={await sourceFor($, picture, local)} columns={columns} rows={rows} alt={`[${caption}]`} />
+          <Image key={imageKey(`image-${picture.n}`)} source={await sourceFor($, picture, local)} columns={columns} rows={rows} alt={`[${caption}]`} />
           {captionButton($, Button, Text, picture.n, caption)}
         </Box>,
       )
@@ -691,7 +793,7 @@ async function drawLightbox($: EngineInterface, e: any, settings: Settings) {
   const alt = `[image ${picture.n}]`
   let body
   if (renderer === 'pixels') {
-    body = <Image key="lightbox-image" source={await sourceFor($, shown, local)} columns={columns} rows={rows} alt={alt} />
+    body = <Image key={imageKey('lightbox-image')} source={await sourceFor($, shown, local)} columns={columns} rows={rows} alt={alt} />
   } else {
     const cells = await cellsFor($, shown, columns, rows, renderer)
     body = cells === undefined ? <Text dimColor>{alt}</Text> : <Raster key="lightbox-cells" columns={columns} rows={rows} cells={cells} />
@@ -746,7 +848,7 @@ async function drawLightbox($: EngineInterface, e: any, settings: Settings) {
       const size = fitCells(one.original.width, one.original.height, THUMB.columns, THUMB.rows)
       let thumb
       if (renderer === 'pixels') {
-        thumb = <Image key={`thumb-${n}`} source={await sourceFor($, one, local)} columns={size.columns} rows={size.rows} alt={`[${n}]`} />
+        thumb = <Image key={imageKey(`thumb-${n}`)} source={await sourceFor($, one, local)} columns={size.columns} rows={size.rows} alt={`[${n}]`} />
       } else {
         const cells = await cellsFor($, one, size.columns, size.rows, renderer)
         thumb = cells === undefined ? <Text dimColor>{`[${n}]`}</Text> : <Raster key={`thumb-${n}`} columns={size.columns} rows={size.rows} cells={cells} />
@@ -888,6 +990,7 @@ export const register: Register = (on, options) => {
     // Decodes are named by content, so a week-old one is only ever a leftover.
     const dir = await dirFor($)
     void $.process.run(['find', dir, '-type', 'f', '-mtime', '+7', '-delete']).catch(() => undefined)
+    await watchTmux($)
     return next(e)
   })
 
