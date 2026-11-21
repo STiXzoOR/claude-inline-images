@@ -40,6 +40,8 @@ type World = {
   cropFails?: number
   /** Asked before each crop: a promise holds it until it resolves. */
   cropGate?: () => Promise<void> | undefined
+  /** What `tmux list-clients` and `ps` print; left out, both fail, as outside tmux. */
+  tmux?: { clients: string; ps: string }
 }
 type Run = { argv: readonly string[]; stdin?: string }
 
@@ -50,7 +52,7 @@ const failed = { value: { exitCode: 1, stdout: '', stderr: 'no', isStdoutTruncat
 
 const world = (
   on: On,
-  { terminal = 'WarpTerminal', hasMagick = true, canDecode = true, history = [], env = {}, png = PNG, decoded = '2 2 2 2', cropFails = 0, cropGate }: World = {},
+  { terminal = 'WarpTerminal', hasMagick = true, canDecode = true, history = [], env = {}, png = PNG, decoded = '2 2 2 2', cropFails = 0, cropGate, tmux }: World = {},
 ) => {
   const runs: Run[] = []
   const files = new Map<string, string>()
@@ -83,6 +85,8 @@ const world = (
       }
       return ok(decoded)
     }
+    if (command === 'tmux') return tmux === undefined ? failed : ok(tmux.clients)
+    if (command === 'ps') return tmux === undefined ? failed : ok(tmux.ps)
     if (command === 'sips' || command === '/usr/bin/sips') {
       if (!canDecode) return failed
       return ok(e.argv.includes('-g') ? 'pixelWidth: 2\n  pixelHeight: 2\n' : '')
@@ -217,12 +221,12 @@ test('draws real pixels where Claude Code draws pictures, as in Ghostty', async 
   expect(source?.file).toMatch(/\/claude-inline-images\/[0-9a-f]+\.png$/)
 })
 
-// A file name draws only where the terminal can open the file. Inside tmux a
-// client may be attached from another machine, and over ssh the terminal is on
-// another machine, so both get the picture's own bytes.
+// A file name draws only where the terminal can open the file. Over ssh the
+// terminal is on another machine, and inside tmux a client may be, so both get
+// the picture's own bytes unless every tmux client is known to be local.
 const FORCED = { CLAUDE_CODE_FORCE_TERMINAL_IMAGES: '1' }
 
-test('sends the picture itself inside tmux, where a client may sit on another machine', async ($, on) => {
+test('sends the picture itself inside tmux when it can\'t tell where the clients are', async ($, on) => {
   world(on, { terminal: 'tmux', env: { ...FORCED, TMUX: '/tmp/tmux-0/default,1,0' } })
   await pasted($, UUID)
 
@@ -239,6 +243,185 @@ test('sends the picture itself over ssh', async ($, on) => {
 
   expect((await ui.find({ type: 'Image' }))?.props.source).toEqual({ png: PNG })
 })
+
+// Ghostty runs the shell that attached one client; sshd the shell that attached another.
+const PS = [
+  '    1     0 /sbin/launchd',
+  '  700     1 /Applications/Ghostty.app/Contents/MacOS/ghostty',
+  '  701   700 -zsh',
+  '  702   701 tmux',
+  '  900     1 /usr/sbin/sshd',
+  '  901   900 -zsh',
+  '  902   901 tmux',
+].join('\n')
+const IN_TMUX = { ...FORCED, TMUX: '/tmp/tmux-501/default,1,0', TMUX_PANE: '%3' }
+
+test('sends a file name inside tmux when every client is on this machine', async ($, on) => {
+  const runs = world(on, { terminal: 'tmux', env: IN_TMUX, tmux: { clients: '702 /dev/ttys001\n', ps: PS } })
+  await pasted($, UUID)
+
+  const ui = await mountPrompt($)
+
+  const source = (await ui.find({ type: 'Image' }))?.props.source as { file?: string; format?: string } | undefined
+  expect(source?.format).toBe('png')
+  expect(source?.file).toMatch(/\/claude-inline-images\/[0-9a-f]+\.png$/)
+  expect(runs.find(run => run.argv[0] === 'tmux')?.argv).toEqual([
+    'tmux', '-S', '/tmp/tmux-501/default', 'list-clients', '-t', '%3', '-F', '#{client_pid} #{client_tty}',
+  ])
+})
+
+test('sends the picture itself inside tmux when a client is attached over ssh', async ($, on) => {
+  world(on, { terminal: 'tmux', env: IN_TMUX, tmux: { clients: '702 /dev/ttys001\n902 /dev/ttys002\n', ps: PS } })
+  await pasted($, UUID)
+
+  const ui = await mountPrompt($)
+
+  expect((await ui.find({ type: 'Image' }))?.props.source).toEqual({ png: PNG })
+})
+
+test('sends a file name wherever CLAUDE_INLINE_IMAGES_LOCAL=1 says the terminal can open it', async ($, on) => {
+  world(on, { terminal: 'tmux', env: { ...IN_TMUX, SSH_CONNECTION: '203.0.113.5 50022 198.51.100.7 22', CLAUDE_INLINE_IMAGES_LOCAL: '1' } })
+  await pasted($, UUID)
+
+  const ui = await mountPrompt($)
+
+  expect(((await ui.find({ type: 'Image' }))?.props.source as { file?: string } | undefined)?.file).toMatch(/\.png$/)
+})
+
+test('sends the picture itself wherever CLAUDE_INLINE_IMAGES_LOCAL=0 says to', async ($, on) => {
+  const runs = world(on, { terminal: 'tmux', env: { ...IN_TMUX, CLAUDE_INLINE_IMAGES_LOCAL: '0' }, tmux: { clients: '702 /dev/ttys001\n', ps: PS } })
+  await pasted($, UUID)
+
+  const ui = await mountPrompt($)
+
+  expect((await ui.find({ type: 'Image' }))?.props.source).toEqual({ png: PNG })
+  expect(runs.some(run => run.argv[0] === 'tmux')).toBe(false)
+})
+
+// The watch: tmux is asked every two seconds which clients are attached, and
+// the pictures are drawn again when the answer changes.
+const start = async ($: Engine, on: On) => {
+  on('command.register', () => ({ value: {} as never }))
+  on('session.start', ($, e) => e)
+  await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
+}
+const sourceOf = async (ui: { find: (query: { type: string }) => Promise<{ props: Record<string, unknown> } | undefined> }) =>
+  (await ui.find({ type: 'Image' }))?.props.source as { file?: string; png?: string } | undefined
+const commands = (runs: Run[], name: string) => runs.filter(run => run.argv[0] === name).length
+
+test('asks the clients inside tmux even with SSH_CONNECTION set, which tmux copies from the last client to attach', async ($, on) => {
+  world(on, { terminal: 'tmux', env: { ...IN_TMUX, SSH_CONNECTION: '::1 50022 ::1 22' }, tmux: { clients: '702 /dev/ttys001\n', ps: PS } })
+  await pasted($, UUID)
+
+  const ui = await mountPrompt($)
+
+  expect((await sourceOf(ui))?.file).toMatch(/\.png$/)
+})
+
+test('draws the pictures again as bytes when a client attaches over ssh', async ($, on) => {
+  const clock = mock.clock(on)
+  const tmux = { clients: '702 /dev/ttys001\n', ps: PS }
+  const runs = world(on, { terminal: 'tmux', env: IN_TMUX, tmux })
+  await start($, on)
+  await pasted($, UUID)
+  const ui = await mountPrompt($)
+  expect((await sourceOf(ui))?.file).toMatch(/\.png$/)
+
+  tmux.clients = '702 /dev/ttys001\n902 /dev/ttys002\n'
+  await clock.advance(2_000)
+
+  expect(await sourceOf(ui)).toEqual({ png: PNG })
+  // Sent again under a new key, then the terminal that attached is redrawn to paint it.
+  expect(await ui.find({ type: 'Image', key: 'image-1~1' })).toBeDefined()
+  // Redrawn once the bytes have had time to arrive, and again for big or many pictures.
+  const refreshes = () => runs.filter(run => run.argv.includes('refresh-client')).map(run => run.argv)
+  await clock.advance(900)
+  expect(refreshes()).toEqual([])
+  await clock.advance(100)
+  expect(refreshes()).toEqual([['tmux', '-S', '/tmp/tmux-501/default', 'refresh-client', '-t', '/dev/ttys002']])
+  await clock.advance(2_000)
+  expect(refreshes()).toHaveLength(2)
+})
+
+test('sends the pictures again to a terminal that attaches when nothing else changes', async ($, on) => {
+  const clock = mock.clock(on)
+  const tmux = { clients: '902 /dev/ttys002\n', ps: PS }
+  const runs = world(on, { terminal: 'tmux', env: IN_TMUX, tmux })
+  await start($, on)
+  await pasted($, UUID)
+  const ui = await mountPrompt($)
+  expect(await sourceOf(ui)).toEqual({ png: PNG })
+
+  // Another terminal attaches over ssh: still bytes, but it never got them.
+  tmux.clients = '902 /dev/ttys002\n4242 /dev/ttys003\n'
+  await clock.advance(5_000)
+
+  expect(await ui.find({ type: 'Image', key: 'image-1~1' })).toBeDefined()
+  expect(runs.filter(run => run.argv.includes('refresh-client')).map(run => run.argv.at(-1))).toEqual(['/dev/ttys003', '/dev/ttys003'])
+})
+
+test('draws them again as file names when the ssh client leaves', async ($, on) => {
+  const clock = mock.clock(on)
+  const tmux = { clients: '702 /dev/ttys001\n902 /dev/ttys002\n', ps: PS }
+  world(on, { terminal: 'tmux', env: IN_TMUX, tmux })
+  await start($, on)
+  await pasted($, UUID)
+  const ui = await mountPrompt($)
+  expect(await sourceOf(ui)).toEqual({ png: PNG })
+
+  tmux.clients = '702 /dev/ttys001\n'
+  await clock.advance(2_000)
+
+  expect((await sourceOf(ui))?.file).toMatch(/\.png$/)
+})
+
+test('runs ps again only when the attached clients change', async ($, on) => {
+  const clock = mock.clock(on)
+  const tmux = { clients: '702 /dev/ttys001\n', ps: PS }
+  const runs = world(on, { terminal: 'tmux', env: IN_TMUX, tmux })
+  await start($, on)
+  await pasted($, UUID)
+  await mountPrompt($)
+
+  await clock.advance(6_000)
+  expect(commands(runs, 'tmux')).toBe(4)
+  expect(commands(runs, 'ps')).toBe(1)
+
+  // The same clients listed in another order are the same clients.
+  tmux.clients = '902 /dev/ttys002\n702 /dev/ttys001\n'
+  await clock.advance(2_000)
+  tmux.clients = '702 /dev/ttys001\n902 /dev/ttys002\n'
+  await clock.advance(2_000)
+  expect(commands(runs, 'ps')).toBe(2)
+})
+
+test('asks tmux nothing until a picture draws', async ($, on) => {
+  const clock = mock.clock(on)
+  const runs = world(on, { terminal: 'tmux', env: IN_TMUX, tmux: { clients: '702 /dev/ttys001\n', ps: PS } })
+  await start($, on)
+
+  await clock.advance(10_000)
+
+  expect(commands(runs, 'tmux')).toBe(0)
+})
+
+for (const [where, env] of [
+  ['outside tmux', { ...FORCED }],
+  ['over ssh', { ...FORCED, SSH_CONNECTION: '203.0.113.5 50022 198.51.100.7 22' }],
+  ['where CLAUDE_INLINE_IMAGES_LOCAL says', { ...IN_TMUX, CLAUDE_INLINE_IMAGES_LOCAL: '1' }],
+] as const) {
+  test(`watches no tmux clients ${where}`, async ($, on) => {
+    const clock = mock.clock(on)
+    const runs = world(on, { terminal: 'ghostty', env, tmux: { clients: '702 /dev/ttys001\n', ps: PS } })
+    await start($, on)
+    await pasted($, UUID)
+    await mountPrompt($)
+
+    await clock.advance(10_000)
+
+    expect(commands(runs, 'tmux')).toBe(0)
+  })
+}
 
 test('sends the small pixel copy when the PNG is past the 2 MiB an Image takes', async ($, on) => {
   // 2,800,000 base64 characters are 2,100,000 bytes, just past 2 MiB.

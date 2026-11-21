@@ -95,6 +95,8 @@ alias clauded='CLAUDE_CODE_FORCE_TERMINAL_IMAGES=$([[ $TERM_PROGRAM == rex ]] &&
 
 On a server you reach from such a terminal, set it in that server's alias unconditionally.
 
+Inside tmux, the mod checks who is attached to the session. When every client runs on this machine (none was started under `sshd` or `mosh-server`), it sends the terminal the picture's file path. When a client is attached from elsewhere, or the check fails, it sends the picture's bytes, which any terminal can draw. It asks again every 2 seconds. tmux replays a newly attached terminal's text but not its pictures, so when a terminal attaches, the mod sends every picture again (as bytes if that terminal is elsewhere) and has tmux redraw that terminal's screen once the bytes have arrived, at 1 and 3 seconds. A terminal that attaches over ssh after the pictures drew gets them within a few seconds, and once it leaves they go back to file paths. Inside tmux the mod ignores `SSH_CONNECTION`, which tmux copies from whichever client attached last into every pane started after. Where the check guesses wrong, `CLAUDE_INLINE_IMAGES_LOCAL=1` says the terminal can open files on this machine, and `CLAUDE_INLINE_IMAGES_LOCAL=0` says it can't.
+
 Warp draws kitty images sent inline, but not the Unicode placeholders `Image` relies on ([warpdotdev/warp#16312](https://github.com/warpdotdev/warp/pull/16312) adds them). It stays on block symbols. Last checked on Warp v0.2026.11.11.
 
 ## Settings
@@ -116,20 +118,22 @@ The mod reads the conversation's images, decodes them and draws them. It makes n
 - `mkdir -p` and `find <cache> -type f -mtime +7 -delete` for its cache in `$TMPDIR/claude-inline-images`
 - `magick <picture> -crop …` when you zoom in the lightbox
 - `open` (macOS) or `xdg-open` (Linux) when you press `v` in the lightbox
+- `tmux list-clients` every 2 seconds inside tmux once a picture has drawn there, and `ps -A -o pid=,ppid=,comm=` when the attached clients change, to tell whether every client is on this machine
+- `tmux refresh-client -t <tty>` for a terminal that just attached, 1 and 3 seconds after its pictures were sent again, so it paints them
 
 Decodes are named by content, so a picture seen twice is decoded once.
 
 ## Troubleshooting
 
 - **Block symbols in Rex, or in tmux under Ghostty.** Claude Code doesn't know the terminal draws images: set `CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1` (see the table).
-- **A blank box where the picture should be.** The terminal was sent a file it can't open. Since 0.2.2, the mod sends the picture's bytes whenever it runs inside tmux or over ssh. Update, and check that tmux has `allow-passthrough on`.
+- **A blank box where the picture should be.** The terminal was sent a file it can't open. Since 0.2.2, the mod sends the picture's bytes over ssh, and inside tmux unless every client is on this machine. Update, and check that tmux has `allow-passthrough on`. If a client the check can't see sits elsewhere, as with a tunnel other than ssh or mosh, set `CLAUDE_INLINE_IMAGES_LOCAL=0`. A terminal that attached to tmux gets its pictures a few seconds later; if one stays blank, resizing the window redraws it.
 - **Washed-out colours inside tmux.** Claude Code limits itself to 256 colours in tmux. Set `CLAUDE_CODE_TMUX_TRUECOLOR=1`, and tell tmux your terminal has truecolor: `set -as terminal-features "<your $TERM>:RGB"`.
 - **No picture under the row.** Nothing could decode it, so the mod leaves the row as Claude Code drew it. Install ImageMagick 7 so that `magick` is on `PATH`.
 - **Nothing drawn at all.** Check `claude --version` (2.1.311 or later) and that `/plugin` lists `inline-images` as enabled. Restart Claude Code after an install or update.
 
 ## How it works
 
-The mod hooks the transcript rows that hold images (`UserMessage`, `ToolResult`, `ToolGroup`) and draws each picture below the row Claude Code drew. For real pixels it hands Claude Code's `Image` element the picture. On the same machine as the terminal, that's the file's path. Inside tmux or over ssh, it's the PNG's bytes (or past the 2 MiB an `Image` takes, the 480-pixel copy), because a terminal on another machine can't open a path on this one. For block symbols it renders the 480-pixel copy into a `Raster` of cells, each one the closest of 24 glyphs (halves, quadrants, eighths) in two colours, averaged in linear light.
+The mod hooks the transcript rows that hold images (`UserMessage`, `ToolResult`, `ToolGroup`) and draws each picture below the row Claude Code drew. For real pixels it hands Claude Code's `Image` element the picture. On the same machine as the terminal, including tmux with every client local, that's the file's path. Over ssh, or in tmux with a client elsewhere, it's the PNG's bytes (or past the 2 MiB an `Image` takes, the 480-pixel copy), because a terminal on another machine can't open a path on this one. For block symbols it renders the 480-pixel copy into a `Raster` of cells, each one the closest of 24 glyphs (halves, quadrants, eighths) in two colours, averaged in linear light.
 
 ## Develop
 
